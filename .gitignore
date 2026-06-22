@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+mcp-sentinel-audit.jsonl
