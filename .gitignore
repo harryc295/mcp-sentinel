@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 mcp-sentinel-audit.jsonl
+demo/transcript.txt
+demo/demo-audit.jsonl
+demo/sentinel-stderr.log

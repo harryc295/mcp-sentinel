@@ -45,6 +45,14 @@ class StaticRuleTests(unittest.TestCase):
         self.assertEqual(severity, "high")
         self.assertTrue(reasons)
 
+    def test_word_containing_a_keyword_as_a_substring_is_not_a_false_positive(self):
+        # Found by testing against the real @modelcontextprotocol/server-everything
+        # reference server: "information" contains "format" as a substring.
+        tool = {"name": "simulate-research-query", "description": "Gathers, analyzes, and synthesizes information."}
+        severity, reasons = classify_tool(tool)
+        self.assertEqual(severity, "low")
+        self.assertEqual(reasons, [])
+
 
 class ServerPostureTests(unittest.TestCase):
     def test_lethal_trifecta_needs_all_three_legs(self):
@@ -81,6 +89,14 @@ class PayloadCheckTests(unittest.TestCase):
     def test_public_url_is_quiet(self):
         flags = check_payload("fetch_url", "Fetches a URL.", {"url": "https://example.com/page"})
         self.assertEqual(flags, [])
+
+    def test_path_traversal_nested_inside_an_object_argument_is_still_flagged(self):
+        flags = check_payload("read_file", "Reads a local file.", {"options": {"path": "../../etc/passwd"}})
+        self.assertTrue(flags)
+
+    def test_ssrf_nested_inside_a_list_argument_is_still_flagged(self):
+        flags = check_payload("fetch_url", "Fetches a URL.", {"requests": [{"url": "http://169.254.169.254/"}]})
+        self.assertTrue(flags)
 
     def test_shell_metacharacters_into_exec_tool_flagged(self):
         flags = check_payload("run_command", "Runs a shell command.", {"command": "ls; rm -rf /"})

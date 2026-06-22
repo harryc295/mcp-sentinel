@@ -27,9 +27,17 @@ class Rule:
 
 _DESTRUCTIVE_KEYWORDS = (
     "exec", "eval", "shell", "subprocess", "delete", "remove", "drop",
-    "sudo", "kill", "format", "truncate", "overwrite", "rm_",
+    "sudo", "kill", "wipe", "truncate", "overwrite", "rm_",
 )
 _CONFIRM_PARAM_HINTS = ("confirm", "dry_run", "dryrun", "force")
+
+
+def _has_keyword(text: str, keywords) -> Optional[str]:
+    """Word-boundary keyword search -- plain substring matching flagged
+    'information' as destructive because it contains 'format'. Anchoring to
+    a word start avoids that without losing matches on suffixes like
+    'deletes'/'deletion'."""
+    return next((kw for kw in keywords if re.search(rf"\b{re.escape(kw)}", text)), None)
 
 _INJECTION_PHRASES = (
     "ignore previous instructions", "ignore all previous", "disregard the system prompt",
@@ -51,7 +59,7 @@ def _text(tool: dict) -> str:
 
 def _check_destructive_without_confirmation(tool: dict) -> Optional[str]:
     text = _text(tool)
-    hit = next((kw for kw in _DESTRUCTIVE_KEYWORDS if kw in text), None)
+    hit = _has_keyword(text, _DESTRUCTIVE_KEYWORDS)
     if not hit:
         return None
     props = tool.get("inputSchema", {}).get("properties", {})
@@ -125,7 +133,7 @@ _EXFIL_KW = ("send_email", "http_post", "webhook", "publish", "write_file", "pos
 
 
 def _matches_any(text: str, keywords) -> bool:
-    return any(kw in text for kw in keywords)
+    return _has_keyword(text, keywords) is not None
 
 
 def check_lethal_trifecta(tools: list[dict]) -> Optional[str]:
@@ -179,13 +187,27 @@ def _is_private_or_local_host(host: str) -> bool:
         return host.lower() == "localhost"
 
 
+def _iter_string_leaves(value, path=""):
+    """Walk nested dict/list argument values -- a malicious path or URL can
+    arrive as {"options": {"path": "../../etc/passwd"}} just as easily as a
+    top-level argument, and a scan of top-level values only would miss it."""
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for key, sub in value.items():
+            yield from _iter_string_leaves(sub, f"{path}.{key}" if path else key)
+    elif isinstance(value, list):
+        for i, sub in enumerate(value):
+            yield from _iter_string_leaves(sub, f"{path}[{i}]")
+
+
 def check_payload(tool_name: str, description: str, arguments: dict) -> list[str]:
     flags = []
     text_lower = f"{tool_name} {description or ''}".lower()
-    for key, value in (arguments or {}).items():
-        if not isinstance(value, str):
-            continue
+    is_exec_tool = _matches_any(text_lower, _EXEC_HINTS)
+    is_exfil_tool = _matches_any(text_lower, _EXFIL_KW)
 
+    for key, value in _iter_string_leaves(arguments or {}):
         if _PATH_TRAVERSAL_RE.search(value) or any(hint in value.lower() for hint in _SENSITIVE_PATH_HINTS):
             flags.append(f"argument '{key}' looks like a path-traversal/sensitive-path attempt: {value!r}")
 
@@ -194,10 +216,10 @@ def check_payload(tool_name: str, description: str, arguments: dict) -> list[str
             if host and _is_private_or_local_host(host):
                 flags.append(f"argument '{key}' targets a private/internal host ({host}) -- possible SSRF")
 
-        if _matches_any(text_lower, _EXEC_HINTS) and any(c in value for c in _SHELL_METACHARS):
+        if is_exec_tool and any(c in value for c in _SHELL_METACHARS):
             flags.append(f"argument '{key}' contains shell metacharacters passed to an exec-like tool: {value!r}")
 
-        if _matches_any(text_lower, _EXFIL_KW) and _SECRET_VALUE_RE.search(value):
+        if is_exfil_tool and _SECRET_VALUE_RE.search(value):
             flags.append(f"argument '{key}' looks like a credential being sent through an external-communication tool")
 
     return flags

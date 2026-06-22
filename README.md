@@ -1,5 +1,7 @@
 # mcp-sentinel
 
+[![test](https://github.com/harryc295/mcp-sentinel/actions/workflows/test.yml/badge.svg)](https://github.com/harryc295/mcp-sentinel/actions/workflows/test.yml)
+
 A proxy that sits between an MCP client and a real MCP server. It scores
 every tool the server exposes, then inspects the arguments on every
 `tools/call` before forwarding it. Calls that match a risk threshold or a
@@ -13,6 +15,20 @@ description, or a model that gets tricked into passing `../../etc/passwd`
 as a path, slips past a one-time audit. mcp-sentinel sits in the call path
 and checks both: the tool definition at connect time, and the live payload
 on every call.
+
+## Demo
+
+Wrapping a support-agent MCP server that mixes a hidden admin tool in with
+normal ones. Connect-time scan, then five live calls: one normal read, and
+four attacks, all blocked.
+
+![Startup scan](demo/demo-1-startup-scan.png)
+![Live tool calls](demo/demo-2-live-blocks.png)
+
+Source for this demo, including the throwaway downstream server it runs
+against, is in [`demo/`](demo/) -- the data in it (`prod_customers`, the
+leaked-looking key) is fake, generated for this README. Run it yourself
+with `python demo/run_demo.py`.
 
 ## Quickstart
 
@@ -70,6 +86,21 @@ downstream server, a real sentinel instance in front of it, a real client
 session on top, and assertions that a blocked tool never appears in the
 tool list and a malicious argument gets rejected mid-call. No subprocess
 required to run it.
+
+## Tested against a real server
+
+Wrapping the official `@modelcontextprotocol/server-everything` reference
+server (13 tools), it now shows all 13 with one true connect-time finding
+(an unpinned `npx` launch) and zero false positives. The first run found a
+bug instead: one tool's description used the word "information," which
+contains "format" as a substring, and the keyword check at the time matched
+on that and hid the tool. The fix anchors keyword matching to a word
+boundary; `test_word_containing_a_keyword_as_a_substring_is_not_a_false_positive`
+in `test_rules.py` covers the exact case so it can't come back quietly.
+
+Payload checks also walk nested arguments, not just top-level ones --
+`{"options": {"path": "../../etc/passwd"}}` gets caught the same as a
+top-level `path` argument would.
 
 ## Limits
 
