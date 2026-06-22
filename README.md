@@ -53,7 +53,22 @@ the real command directly. In a Claude Desktop / Claude Code config:
 ```
 
 mcp-sentinel writes every call to `mcp-sentinel-audit.jsonl`: timestamp,
-tool, arguments, decision, reason.
+tool, arguments, decision, reason. Credential-shaped argument values are
+redacted before they're written, so a blocked exfil attempt doesn't leave
+the credential sitting in the log that caught it. `--call-timeout` (default
+30s) bounds how long a downstream call can hang before mcp-sentinel gives
+up on it.
+
+The official SDK only forwards a curated allowlist of "safe" env vars to a
+spawned process by default, not the caller's full environment -- which
+would otherwise mean a token set via the `"env"` block in the client config
+above silently never reaches the server it was meant for, since that block
+sets the environment for *mcp-sentinel's* process, one hop away from the
+real server. mcp-sentinel forwards its own full environment down to the
+downstream process to close that gap, the same as if the client had
+launched the real command directly. `--env KEY=VALUE` is there for setting
+a var when running the CLI directly, without exporting it into your shell
+first.
 
 ## What it catches
 
@@ -79,7 +94,11 @@ of the threshold. They describe what happened in this one call.
 mcp-sentinel runs the official `mcp` SDK on both sides. Downstream, it opens
 a real client session against the wrapped server. Upstream, it runs its own
 server that the calling client talks to. Every `tools/list` and `tools/call`
-passes through `rules.py` before it reaches either side.
+passes through `rules.py` before it reaches either side. Resources and
+prompts pass straight through unscored if the downstream server has them
+(scoring is tools-only for now), and only get advertised upstream if the
+downstream actually supports them, so mcp-sentinel doesn't claim a
+capability the real server doesn't have.
 
 `test_sentinel.py` proves this over the SDK's in-memory transport: a fake
 downstream server, a real sentinel instance in front of it, a real client
@@ -100,7 +119,31 @@ in `test_rules.py` covers the exact case so it can't come back quietly.
 
 Payload checks also walk nested arguments, not just top-level ones --
 `{"options": {"path": "../../etc/passwd"}}` gets caught the same as a
-top-level `path` argument would.
+top-level `path` argument would. The same real-server test also surfaced
+two correctness gaps that had nothing to do with the rule engine: the
+reference server uses resources and prompts, which mcp-sentinel didn't
+proxy at all before (any client call to either would fail outright); and
+env vars set via a client's `"env"` config block weren't reaching the
+wrapped server, because the SDK only forwards a curated allowlist by
+default. Both are fixed and covered by tests now.
+
+## Production readiness
+
+What's covered: a downstream crash or an unreachable command fails with a
+readable message instead of a raw traceback, a hung call times out
+(`--call-timeout`) instead of blocking forever, an oversized argument
+payload is rejected before it reaches the regex engine, secrets are
+redacted out of the audit log, and resources/prompts proxy correctly
+without mcp-sentinel claiming a capability the downstream server doesn't
+have.
+
+What's not: this has been run against one official reference server and a
+handful of hand-built ones, not a wide corpus of real-world MCP servers.
+There's no handling yet for a server sending `tools/list_changed` mid-session
+(severities are computed once, at connect time). There's no concurrency or
+load testing; it's built for one client and one wrapped server per process,
+which matches how MCP clients invoke servers today. Call that a tested v1,
+not a production deployment.
 
 ## Limits
 
