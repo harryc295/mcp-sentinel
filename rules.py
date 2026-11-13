@@ -69,16 +69,22 @@ def _check_destructive_without_confirmation(tool: dict) -> Optional[str]:
     return f"name/description suggests a destructive action ('{hit}') with no confirm/dry_run/force parameter"
 
 
+def _model_visible_text(tool: dict) -> str:
+    """The description plus any other text the client may show the model (title, schema
+    descriptions, annotations), which callers pass in as `otherText`."""
+    return f"{tool.get('description', '')} {tool.get('otherText', '')}".lower()
+
+
 def _check_injection_phrase(tool: dict) -> Optional[str]:
-    desc = tool.get("description", "").lower()
-    hit = next((p for p in _INJECTION_PHRASES if p in desc), None)
-    return f"description contains a prompt-injection-style phrase: '{hit}'" if hit else None
+    text = _model_visible_text(tool)
+    hit = next((p for p in _INJECTION_PHRASES if p in text), None)
+    return f"description or other tool text contains a prompt-injection-style phrase: '{hit}'" if hit else None
 
 
 def _check_imperative_phrase(tool: dict) -> Optional[str]:
-    desc = tool.get("description", "").lower()
-    hit = next((p for p in _IMPERATIVE_PHRASES if p in desc), None)
-    return f"description gives the model a meta-behavioral directive: '{hit}'" if hit else None
+    text = _model_visible_text(tool)
+    hit = next((p for p in _IMPERATIVE_PHRASES if p in text), None)
+    return f"description or other tool text gives the model a meta-behavioral directive: '{hit}'" if hit else None
 
 
 def _check_unconstrained_param(tool: dict) -> Optional[str]:
@@ -182,14 +188,15 @@ _SECRET_VALUE_RE = re.compile(r"(sk-|ghp_|gho_|AKIA|xox[baprs]-)[A-Za-z0-9_\-]{1
 
 
 def _is_private_or_local_host(host: str) -> bool:
+    host = host.lower().rstrip(".")  # resolvers ignore a trailing dot: 127.0.0.1. is 127.0.0.1
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         try:
             # URL parsers also accept short, decimal, hex and octal IPv4 forms: 127.1, 2852039166, 0x7f000001.
             ip = ipaddress.ip_address(socket.inet_aton(host))
-        except OSError:
-            return host.lower().rstrip(".") in _INTERNAL_HOSTNAMES
+        except (OSError, ValueError):  # ValueError: an embedded null byte
+            return host in _INTERNAL_HOSTNAMES
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
@@ -214,11 +221,16 @@ def check_payload(tool_name: str, description: str, arguments: dict) -> list[str
     is_exfil_tool = _matches_any(text_lower, _EXFIL_KW)
 
     for key, value in _iter_string_leaves(arguments or {}):
-        if _PATH_TRAVERSAL_RE.search(value) or any(hint in value.lower() for hint in _SENSITIVE_PATH_HINTS):
+        as_path = value.lower().replace("\\", "/")  # Windows paths: C:\Users\me\.aws\credentials
+        if _PATH_TRAVERSAL_RE.search(value) or any(hint in as_path for hint in _SENSITIVE_PATH_HINTS):
             flags.append(f"argument '{key}' looks like a path-traversal/sensitive-path attempt: {value!r}")
 
         if "://" in value:
-            host = urlsplit(value).hostname
+            try:
+                host = urlsplit(value).hostname
+            except ValueError:
+                flags.append(f"argument '{key}' is a URL that can't be parsed, so its host can't be checked")
+                continue
             if host and _is_private_or_local_host(host):
                 flags.append(f"argument '{key}' targets a private/internal host ({host}) -- possible SSRF")
 

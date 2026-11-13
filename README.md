@@ -98,7 +98,8 @@ mcp-sentinel runs the official `mcp` SDK on both sides. Downstream, it opens
 a real client session against the wrapped server. Upstream, it runs its own
 server that the calling client talks to. Every `tools/list` and `tools/call`
 passes through `rules.py` before it reaches either side. At startup it reads
-every page of the server's tool list and scores each tool. The client only
+every page of the server's tool list and scores each tool, including text
+outside the description (title, schema descriptions, annotations). The client only
 ever sees that scored snapshot, so a server can't swap in a poisoned
 description later (a "rug pull"). A tool name listed twice, or a tool that
 wasn't listed at startup, is never scored, so calls to it get blocked.

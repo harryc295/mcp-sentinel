@@ -96,6 +96,21 @@ class PayloadCheckTests(unittest.TestCase):
         flags = check_payload("fetch_url", "Fetches a URL.", {"url": "http://metadata.google.internal/computeMetadata/v1/"})
         self.assertTrue(flags)
 
+    def test_ssrf_with_a_trailing_dot_on_the_ip_is_flagged(self):
+        for url in ("http://127.0.0.1./admin", "http://169.254.169.254./latest", "http://0x7f.1./"):
+            with self.subTest(url=url):
+                self.assertTrue(check_payload("fetch_url", "Fetches a URL.", {"url": url}))
+
+    def test_windows_backslash_sensitive_path_is_flagged(self):
+        self.assertTrue(check_payload("read_file", "Reads a local file.", {"path": "C:\\Users\\me\\.aws\\credentials"}))
+
+    def test_a_url_that_cannot_be_parsed_is_flagged_not_raised(self):
+        self.assertTrue(check_payload("fetch_url", "Fetches a URL.", {"url": "http://[::1/admin"}))
+
+    def test_a_null_byte_in_a_host_does_not_raise(self):
+        # Before, socket.inet_aton raised ValueError here and the call failed with no audit line.
+        self.assertEqual(check_payload("fetch_url", "Fetches a URL.", {"url": "http://a\x00b/"}), [])
+
     def test_shadow_password_file_is_flagged(self):
         self.assertTrue(check_payload("read_file", "Reads a local file.", {"path": "/etc/shadow"}))
 

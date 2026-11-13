@@ -70,14 +70,34 @@ def _uri_forms(uri: str) -> list[str]:
         if decoded == forms[-1]:
             break
         forms.append(decoded)
-    parts = urlsplit(forms[-1])
+    try:
+        parts = urlsplit(forms[-1])
+    except ValueError:
+        return forms  # check_payload flags an unparseable URL itself
     if parts.path:
         forms.append(parts._replace(path=posixpath.normpath(parts.path)).geturl())
     return forms
 
 
+def _strings(value):
+    """Every string in a JSON-like value, dict keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, sub in value.items():
+            yield str(key)
+            yield from _strings(sub)
+    elif isinstance(value, list):
+        for sub in value:
+            yield from _strings(sub)
+
+
 def _tool_to_dict(tool: types.Tool) -> dict:
-    return {"name": tool.name, "description": tool.description or "", "inputSchema": tool.input_schema or {}}
+    # otherText: everything else a client may show the model (title, schema descriptions,
+    # annotations, _meta). The snapshot serves whole Tool objects, so all of it gets scored.
+    other = tool.model_dump(mode="json", exclude={"name", "description"}, exclude_none=True)
+    return {"name": tool.name, "description": tool.description or "", "inputSchema": tool.input_schema or {},
+            "otherText": " ".join(_strings(other))}
 
 
 def _redact(value):
