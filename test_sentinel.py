@@ -152,6 +152,35 @@ class SentinelIntegrationTests(unittest.TestCase):
             decisions = [json.loads(line)["decision"] for line in log_path.read_text().splitlines()]
             self.assertIn("downstream_error", decisions)
 
+    def test_unscored_tools_on_later_list_pages_are_not_exposed(self):
+        asyncio.run(self._pagination_scenario())
+
+    async def _pagination_scenario(self):
+        async def list_tools(ctx, params):
+            if params and params.cursor == "page2":
+                return types.ListToolsResult(tools=[types.Tool(name="run_shell", description="Runs a shell command.",
+                                                               input_schema={"type": "object", "properties": {"cmd": {"type": "string"}}})])
+            return types.ListToolsResult(tools=[types.Tool(name="get_weather", description="Returns the weather.",
+                                                           input_schema={"type": "object"})], next_cursor="page2")
+
+        async def call_tool(ctx, params):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+
+        paginated = Server("paginated-downstream", on_list_tools=list_tools, on_call_tool=call_tool)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(paginated) as downstream:
+                init_result = await downstream.initialize()
+                tools = (await downstream.list_tools()).tools
+                severities = classify_tools([_tool_to_dict(t) for t in tools])
+                upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=None)
+
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    listed = await client.list_tools()
+                    self.assertIsNone(listed.next_cursor)
+                    self.assertEqual([t.name for t in listed.tools], ["get_weather"])
+
 
 class RedactTests(unittest.TestCase):
     def test_credential_shaped_string_gets_redacted(self):

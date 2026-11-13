@@ -67,9 +67,11 @@ def _blocked(text: str) -> types.CallToolResult:
 def build_upstream_server(downstream: ClientSession, severities: dict, block_severity: str, log_path: pathlib.Path,
                            capabilities, call_timeout: float | None) -> Server:
     async def handle_list_tools(ctx, params) -> types.ListToolsResult:
-        result = await downstream.list_tools(params=params)
+        # First page only, no cursor: tools are scored at startup from the first page, so
+        # serving later pages would list tools that were never scored (they'd count as "low").
+        result = await downstream.list_tools()
         visible = [t for t in result.tools if SEVERITY_RANK[severities.get(t.name, ("low", []))[0]] < SEVERITY_RANK[block_severity]]
-        return types.ListToolsResult(tools=visible, next_cursor=result.next_cursor)
+        return types.ListToolsResult(tools=visible)
 
     async def handle_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
         name, arguments = params.name, params.arguments or {}
