@@ -92,16 +92,12 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
 
         try:
             result = await downstream.call_tool(name, arguments, read_timeout_seconds=call_timeout)
-        except MCPError as e:
-            # A timed-out call surfaces as MCPError too (the SDK converts the
-            # timeout before it reaches us) -- one branch covers both cases.
+        except (MCPError, RuntimeError) as e:
+            # MCPError covers downstream errors and timeouts (the SDK converts the timeout
+            # before it reaches us). RuntimeError is how the 2.x SDK refuses an "input
+            # required" or claimed reply: neither is proxied, so the call fails closed.
             _log(log_path, {"event": "call", "tool": name, "arguments": "<omitted, already logged above>", "decision": "downstream_error", "reason": str(e)})
             return _blocked(f"downstream error: {e}")
-        if not isinstance(result, types.CallToolResult):
-            # Multi-round "input required" replies aren't proxied: fail closed rather than pass through something unchecked.
-            _log(log_path, {"event": "call", "tool": name, "arguments": "<omitted, already logged above>", "decision": "downstream_error",
-                             "reason": f"unsupported downstream reply: {type(result).__name__}"})
-            return _blocked("downstream error: unsupported reply type")
         return result
 
     handlers = {"on_list_tools": handle_list_tools, "on_call_tool": handle_call_tool}

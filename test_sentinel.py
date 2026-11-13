@@ -12,8 +12,8 @@ from contextlib import asynccontextmanager
 import anyio
 import mcp.types as types
 from mcp import ClientSession
-from mcp.client._memory import InMemoryTransport
 from mcp.server.lowlevel import Server
+from mcp.shared.memory import create_client_server_memory_streams
 
 from rules import classify_tools
 from sentinel import _effective_env, _parse_env, _redact, _tool_to_dict, build_upstream_server
@@ -22,9 +22,12 @@ from sentinel import _effective_env, _parse_env, _redact, _tool_to_dict, build_u
 @asynccontextmanager
 async def _connect(server: Server):
     """A ClientSession wired to `server` in memory: the same client type sentinel uses for real."""
-    async with InMemoryTransport(server) as (read, write):
-        async with ClientSession(read, write) as session:
-            yield session
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(lambda: server.run(*server_streams, server.create_initialization_options()))
+            async with ClientSession(*client_streams) as session:
+                yield session
+            tg.cancel_scope.cancel()
 
 
 def _make_fake_downstream(with_resources=False, slow_tool_seconds=0.0) -> Server:
@@ -137,7 +140,7 @@ class SentinelIntegrationTests(unittest.TestCase):
     async def _timeout_scenario(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = pathlib.Path(tmp) / "audit.jsonl"
-            async with _connect(_make_fake_downstream(slow_tool_seconds=5)) as downstream:
+            async with _connect(_make_fake_downstream(slow_tool_seconds=1)) as downstream:
                 init_result = await downstream.initialize()
                 tools = (await downstream.list_tools()).tools
                 severities = classify_tools([_tool_to_dict(t) for t in tools])
@@ -180,6 +183,28 @@ class SentinelIntegrationTests(unittest.TestCase):
                     listed = await client.list_tools()
                     self.assertIsNone(listed.next_cursor)
                     self.assertEqual([t.name for t in listed.tools], ["get_weather"])
+
+    def test_an_unexpected_downstream_reply_is_refused_and_audited(self):
+        asyncio.run(self._unexpected_reply_scenario())
+
+    async def _unexpected_reply_scenario(self):
+        class RaisesLikeTheSdk:
+            """mcp 2.x ClientSession.call_tool raises RuntimeError for input-required or claimed replies."""
+            async def call_tool(self, *args, **kwargs):
+                raise RuntimeError("Server returned InputRequiredResult")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            upstream = build_upstream_server(RaisesLikeTheSdk(), {"get_weather": ("low", [])}, "high", log_path,
+                                             types.ServerCapabilities(), call_timeout=None)
+            async with _connect(upstream) as client:
+                await client.initialize()
+                result = await client.call_tool("get_weather", {"city": "london"})
+                self.assertTrue(result.is_error)
+                self.assertIn("[mcp-sentinel]", result.content[0].text)
+
+            decisions = [json.loads(line)["decision"] for line in log_path.read_text().splitlines()]
+            self.assertIn("downstream_error", decisions)
 
 
 class RedactTests(unittest.TestCase):
