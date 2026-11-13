@@ -98,10 +98,17 @@ mcp-sentinel runs the official `mcp` SDK on both sides. Downstream, it opens
 a real client session against the wrapped server. Upstream, it runs its own
 server that the calling client talks to. Every `tools/list` and `tools/call`
 passes through `rules.py` before it reaches either side. At startup it reads
-every page of the server's tool list and scores each tool. A call to a tool
-it never scored gets blocked. A `resources/read` URI and `prompts/get`
-arguments get the same payload checks as tool arguments, so
-`file:///etc/passwd` or a cloud metadata URL is refused. Resources and
+every page of the server's tool list and scores each tool. The client only
+ever sees that scored snapshot, so a server can't swap in a poisoned
+description later (a "rug pull"). A tool name listed twice, or a tool that
+wasn't listed at startup, is never scored, so calls to it get blocked.
+
+A `resources/read` URI and `prompts/get` arguments get the same payload
+checks as tool arguments. The URI is checked after percent-decoding too, so
+`file:///etc/%70asswd` is caught along with `file:///etc/passwd`. Requests to
+private or loopback IPs (including forms like `http://2852039166/`) and to
+`metadata.google.internal` are refused. That also refuses a server's own
+resources at a sensitive path or a `localhost` URI. Resources and
 prompts only get advertised upstream if the downstream actually supports
 them, so mcp-sentinel doesn't claim a capability the real server doesn't
 have.

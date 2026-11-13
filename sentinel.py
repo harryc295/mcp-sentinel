@@ -11,8 +11,11 @@ import asyncio
 import json
 import os
 import pathlib
+import posixpath
 import sys
+from collections import Counter
 from datetime import datetime, timezone
+from urllib.parse import unquote, urlsplit
 
 import mcp.types as types
 from mcp import ClientSession, MCPError
@@ -32,21 +35,45 @@ from rules import (
 )
 
 MAX_ARGUMENT_BYTES = 64_000  # DoS guard: a multi-MB argument blob isn't a real tool call
-MAX_TOOL_PAGES = 100  # a downstream that never stops paging must not hang startup or tools/list
+MAX_TOOL_PAGES = 100  # a downstream that never stops paging must not hang startup
 
 
-async def list_all_tools(downstream: ClientSession) -> list[types.Tool]:
-    """Every tools/list page. Stops at MAX_TOOL_PAGES or a repeated cursor; a tool past
-    that point is never scored, and calls to unscored tools are blocked."""
+async def list_all_tools(downstream: ClientSession) -> tuple[list[types.Tool], bool]:
+    """Every tools/list page, and whether the list is complete. Stops early at MAX_TOOL_PAGES
+    or a repeated cursor; a tool past that point is never scored, so calls to it are blocked."""
     tools, cursor, seen = [], None, set()
     for _ in range(MAX_TOOL_PAGES):
         result = await downstream.list_tools(params=types.PaginatedRequestParams(cursor=cursor) if cursor else None)
         tools.extend(result.tools)
         cursor = result.next_cursor
-        if not cursor or cursor in seen:
+        if not cursor:
+            return tools, True
+        if cursor in seen:
             break
         seen.add(cursor)
-    return tools
+    return tools, False
+
+
+def _unique_tools(tools: list[types.Tool]) -> tuple[list[types.Tool], list[str]]:
+    """Tools whose name appears once, and the names that appear more than once. A repeated
+    name can't be scored safely (which copy would the server run?), so neither copy is."""
+    counts = Counter(t.name for t in tools)
+    return [t for t in tools if counts[t.name] == 1], sorted(n for n, c in counts.items() if c > 1)
+
+
+def _uri_forms(uri: str) -> list[str]:
+    """The raw URI plus what a resource server will act on: percent-decoded (up to 3 times)
+    and with its dot segments resolved. Checking only the raw text misses file:///%2essh/id_rsa."""
+    forms = [uri]
+    for _ in range(3):
+        decoded = unquote(forms[-1])
+        if decoded == forms[-1]:
+            break
+        forms.append(decoded)
+    parts = urlsplit(forms[-1])
+    if parts.path:
+        forms.append(parts._replace(path=posixpath.normpath(parts.path)).geturl())
+    return forms
 
 
 def _tool_to_dict(tool: types.Tool) -> dict:
@@ -78,22 +105,32 @@ def _blocked(text: str) -> types.CallToolResult:
     return types.CallToolResult(content=[types.TextContent(type="text", text=f"[mcp-sentinel] {text}")], is_error=True)
 
 
-def build_upstream_server(downstream: ClientSession, severities: dict, block_severity: str, log_path: pathlib.Path,
+def build_upstream_server(downstream: ClientSession, tools: list[types.Tool], block_severity: str, log_path: pathlib.Path,
                            capabilities, call_timeout: float | None) -> Server:
-    def _check_or_refuse(event: str, target: str, arguments: dict):
+    """`tools` is the downstream tool list read at startup. It is scored once here, and that
+    snapshot is all the client ever sees."""
+    scored, _ = _unique_tools(tools)
+    severities = classify_tools([_tool_to_dict(t) for t in scored])
+    visible = [t for t in scored if SEVERITY_RANK[severities[t.name][0]] < SEVERITY_RANK[block_severity]]
+
+    def _check_or_refuse(event: str, target: str, arguments: dict, checked: dict | None = None):
         """resources/read and prompts/get carry attacker-reachable input too (a URI, prompt
-        arguments): run the same payload checks as tools/call and refuse with an error."""
-        flags = check_payload(target, "", arguments)
+        arguments): apply the same size limit and payload checks as tools/call and refuse
+        with an error. `checked` is what gets scanned when it differs from what gets logged."""
+        size = len(json.dumps(arguments))
+        if size > MAX_ARGUMENT_BYTES:
+            _log(log_path, {"event": event, "target": target, "arguments": "<omitted, too large>", "decision": "block",
+                             "reason": f"request is {size} bytes, over the {MAX_ARGUMENT_BYTES}-byte limit"})
+            raise MCPError(types.INVALID_PARAMS, "[mcp-sentinel] blocked: request too large")
+        flags = check_payload(target, "", arguments if checked is None else checked)
         _log(log_path, {"event": event, "target": target, "arguments": arguments,
                          "decision": "block" if flags else "allow", "reason": "; ".join(flags)})
         if flags:
             raise MCPError(types.INVALID_PARAMS, f"[mcp-sentinel] blocked: {'; '.join(flags)}")
 
     async def handle_list_tools(ctx, params) -> types.ListToolsResult:
-        # One merged list, no cursor. Only tools scored at startup are listed: a tool that
-        # appeared later was never scored, and handle_call_tool blocks it anyway.
-        tools = await list_all_tools(downstream)
-        visible = [t for t in tools if t.name in severities and SEVERITY_RANK[severities[t.name][0]] < SEVERITY_RANK[block_severity]]
+        # The startup snapshot, not a fresh fetch: the client only sees descriptions that were
+        # scored, so a server can't swap in a poisoned description later (a "rug pull").
         return types.ListToolsResult(tools=visible)
 
     async def handle_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
@@ -105,7 +142,7 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
             return _blocked("blocked: argument payload too large")
 
         if name not in severities:
-            reason = "tool was not listed when mcp-sentinel started, so it was never scored"
+            reason = "tool was not scored when mcp-sentinel started (not listed then, or listed more than once)"
             _log(log_path, {"event": "call", "tool": name, "arguments": arguments, "decision": "block", "reason": reason})
             return _blocked(f"blocked: {reason}")
 
@@ -135,8 +172,9 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
             return await downstream.list_resources(params=params)
 
         async def handle_read_resource(ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
-            _check_or_refuse("resource_read", "resources/read", {"uri": params.uri})
-            return await downstream.read_resource(params.uri)
+            uri = str(params.uri)
+            _check_or_refuse("resource_read", "resources/read", {"uri": uri}, checked={"uri": _uri_forms(uri)})
+            return await downstream.read_resource(uri)
 
         async def handle_list_resource_templates(ctx, params) -> types.ListResourceTemplatesResult:
             return await downstream.list_resource_templates(params=params)
@@ -176,18 +214,24 @@ async def run(command: str, args: list[str], env: dict, block_severity: str, log
     async with stdio_client(server_params) as (down_read, down_write):
         async with ClientSession(down_read, down_write) as downstream:
             init_result = await downstream.initialize()
-            tool_dicts = [_tool_to_dict(t) for t in await list_all_tools(downstream)]
+            tools, complete = await list_all_tools(downstream)
+            if not complete:
+                _log(log_path, {"event": "startup_posture", "detail": f"tools/list did not finish within {MAX_TOOL_PAGES} pages "
+                                 "(or repeated a cursor): tools past that point are not scored and calls to them are blocked"})
+            scored, duplicates = _unique_tools(tools)
+            for name in duplicates:
+                _log(log_path, {"event": "startup_posture", "detail": f"tool '{name}' is listed more than once: it is hidden and calls to it are blocked"})
 
-            trifecta = check_lethal_trifecta(tool_dicts)
+            trifecta = check_lethal_trifecta([_tool_to_dict(t) for t in tools])
             if trifecta:
                 _log(log_path, {"event": "startup_posture", "detail": trifecta})
 
-            severities = classify_tools(tool_dicts)
+            severities = classify_tools([_tool_to_dict(t) for t in scored])
             for name, (severity, reasons) in severities.items():
                 if reasons:
                     _log(log_path, {"event": "startup_classify", "tool": name, "severity": severity, "detail": "; ".join(reasons)})
 
-            upstream = build_upstream_server(downstream, severities, block_severity, log_path, init_result.capabilities, call_timeout)
+            upstream = build_upstream_server(downstream, tools, block_severity, log_path, init_result.capabilities, call_timeout)
             async with stdio_server() as (up_read, up_write):
                 await upstream.run(up_read, up_write, upstream.create_initialization_options())
 

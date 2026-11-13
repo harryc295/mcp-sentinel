@@ -9,6 +9,7 @@ the extra network round trip it costs.
 """
 import ipaddress
 import re
+import socket
 from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.parse import urlsplit
@@ -173,7 +174,8 @@ def check_plaintext_secrets(env: dict) -> list[str]:
 # --- call-time payload checks, run on every tools/call ------------------------
 
 _PATH_TRAVERSAL_RE = re.compile(r"\.\.[\\/]")
-_SENSITIVE_PATH_HINTS = (".ssh", ".aws/credentials", "/etc/passwd", "system32", ".env", "id_rsa")
+_SENSITIVE_PATH_HINTS = (".ssh", ".aws/credentials", "/etc/passwd", "/etc/shadow", "system32", ".env", "id_rsa")
+_INTERNAL_HOSTNAMES = ("localhost", "metadata.google.internal", "metadata")
 _EXEC_HINTS = ("exec", "eval", "shell", "subprocess", "command", "cmd")
 _SHELL_METACHARS = (";", "&&", "|", "`", "$(")
 _SECRET_VALUE_RE = re.compile(r"(sk-|ghp_|gho_|AKIA|xox[baprs]-)[A-Za-z0-9_\-]{10,}")
@@ -182,9 +184,13 @@ _SECRET_VALUE_RE = re.compile(r"(sk-|ghp_|gho_|AKIA|xox[baprs]-)[A-Za-z0-9_\-]{1
 def _is_private_or_local_host(host: str) -> bool:
     try:
         ip = ipaddress.ip_address(host)
-        return ip.is_private or ip.is_loopback or ip.is_link_local
     except ValueError:
-        return host.lower() == "localhost"
+        try:
+            # URL parsers also accept short, decimal, hex and octal IPv4 forms: 127.1, 2852039166, 0x7f000001.
+            ip = ipaddress.ip_address(socket.inet_aton(host))
+        except OSError:
+            return host.lower().rstrip(".") in _INTERNAL_HOSTNAMES
+    return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
 def _iter_string_leaves(value, path=""):
