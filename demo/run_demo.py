@@ -65,7 +65,7 @@ async def main():
                     print(f"\n$ tools/call {name}   # {label}")
                     print(f"  arguments: {args}")
                     result = await session.call_tool(name, args)
-                    verdict = "BLOCKED" if result.isError else "ALLOWED"
+                    verdict = "BLOCKED" if result.is_error else "ALLOWED"
                     text = result.content[0].text if result.content else ""
                     print(f"  -> {verdict}: {text}")
 
