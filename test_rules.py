@@ -86,6 +86,34 @@ class PayloadCheckTests(unittest.TestCase):
         flags = check_payload("fetch_url", "Fetches a URL.", {"url": "http://169.254.169.254/latest/meta-data/"})
         self.assertTrue(flags)
 
+    def test_ssrf_with_a_non_dotted_ip_form_is_flagged(self):
+        # URL parsers accept these short, decimal, hex and octal forms of 169.254.169.254 and 127.0.0.1.
+        for url in ("http://2852039166/latest/meta-data", "http://0x7f000001/", "http://127.1/", "http://0177.0.0.1/"):
+            with self.subTest(url=url):
+                self.assertTrue(check_payload("fetch_url", "Fetches a URL.", {"url": url}))
+
+    def test_ssrf_to_an_internal_metadata_hostname_is_flagged(self):
+        flags = check_payload("fetch_url", "Fetches a URL.", {"url": "http://metadata.google.internal/computeMetadata/v1/"})
+        self.assertTrue(flags)
+
+    def test_ssrf_with_a_trailing_dot_on_the_ip_is_flagged(self):
+        for url in ("http://127.0.0.1./admin", "http://169.254.169.254./latest", "http://0x7f.1./"):
+            with self.subTest(url=url):
+                self.assertTrue(check_payload("fetch_url", "Fetches a URL.", {"url": url}))
+
+    def test_windows_backslash_sensitive_path_is_flagged(self):
+        self.assertTrue(check_payload("read_file", "Reads a local file.", {"path": "C:\\Users\\me\\.aws\\credentials"}))
+
+    def test_a_url_that_cannot_be_parsed_is_flagged_not_raised(self):
+        self.assertTrue(check_payload("fetch_url", "Fetches a URL.", {"url": "http://[::1/admin"}))
+
+    def test_a_null_byte_in_a_host_does_not_raise(self):
+        # Before, socket.inet_aton raised ValueError here and the call failed with no audit line.
+        self.assertEqual(check_payload("fetch_url", "Fetches a URL.", {"url": "http://a\x00b/"}), [])
+
+    def test_shadow_password_file_is_flagged(self):
+        self.assertTrue(check_payload("read_file", "Reads a local file.", {"path": "/etc/shadow"}))
+
     def test_public_url_is_quiet(self):
         flags = check_payload("fetch_url", "Fetches a URL.", {"url": "https://example.com/page"})
         self.assertEqual(flags, [])
