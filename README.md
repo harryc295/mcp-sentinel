@@ -2,10 +2,13 @@
 
 [![test](https://github.com/harryc295/mcp-sentinel/actions/workflows/test.yml/badge.svg)](https://github.com/harryc295/mcp-sentinel/actions/workflows/test.yml)
 
-A proxy that sits between an MCP client and a real MCP server. It scores
-every tool the server exposes, then inspects the arguments on every
-`tools/call` before forwarding it. Calls that match a risk threshold or a
-live attack pattern get blocked instead of logged after the fact.
+A malicious or compromised MCP server can hide instructions in its tool
+descriptions. A model tricked into passing attacker-controlled arguments can
+then leak data or walk the filesystem. mcp-sentinel is a proxy that sits
+between an MCP client and a real MCP server. It scores every tool the server
+exposes and inspects the arguments on every `tools/call` before forwarding it.
+If a call crosses a risk threshold or matches a live attack pattern, the proxy
+blocks it instead of logging it after the fact.
 
 ## Why
 
