@@ -114,8 +114,9 @@ def _redact(value):
 
 def _log(path: pathlib.Path, record: dict):
     record["ts"] = datetime.now(timezone.utc).isoformat()
-    if "arguments" in record:
-        record["arguments"] = _redact(record["arguments"])
+    for field in ("arguments", "reason"):  # a flag reason quotes the flagged value
+        if field in record:
+            record[field] = _redact(record[field])
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
     print(f"[mcp-sentinel] {record['event']}: {record.get('reason', record.get('detail', ''))}", file=sys.stderr)
@@ -137,9 +138,9 @@ def build_upstream_server(downstream: ClientSession, tools: list[types.Tool], bl
         """resources/read and prompts/get carry attacker-reachable input too (a URI, prompt
         arguments): apply the same size limit and payload checks as tools/call and refuse
         with an error. `checked` is what gets scanned when it differs from what gets logged."""
-        size = len(json.dumps(arguments))
+        size = len(target) + len(json.dumps(arguments))  # target carries the prompt name
         if size > MAX_ARGUMENT_BYTES:
-            _log(log_path, {"event": event, "target": target, "arguments": "<omitted, too large>", "decision": "block",
+            _log(log_path, {"event": event, "target": target[:200], "arguments": "<omitted, too large>", "decision": "block",
                              "reason": f"request is {size} bytes, over the {MAX_ARGUMENT_BYTES}-byte limit"})
             raise MCPError(types.INVALID_PARAMS, "[mcp-sentinel] blocked: request too large")
         flags = check_payload(target, "", arguments if checked is None else checked)

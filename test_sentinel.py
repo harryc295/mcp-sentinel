@@ -337,9 +337,17 @@ class SentinelIntegrationTests(unittest.TestCase):
                     with self.assertRaises(MCPError):
                         await client.get_prompt("summarise", {"file": "x" * 100_000})
 
-            gets = [json.loads(line) for line in log_path.read_text().splitlines() if json.loads(line)["event"] == "prompt_get"]
-            self.assertEqual([e["decision"] for e in gets], ["block", "allow", "block"])
-            self.assertNotIn("xxxx", gets[-1]["arguments"])
+                    with self.assertRaises(MCPError):
+                        await client.get_prompt("s" * 100_000, {})
+                    with self.assertRaises(MCPError):
+                        await client.get_prompt("summarise", {"file": ".env?token=ghp_abcdefghijklmnopqrstuvwx"})
+
+            log_text = log_path.read_text()
+            gets = [json.loads(line) for line in log_text.splitlines() if json.loads(line)["event"] == "prompt_get"]
+            self.assertEqual([e["decision"] for e in gets], ["block", "allow", "block", "block", "block"])
+            self.assertNotIn("xxxx", gets[2]["arguments"])
+            self.assertNotIn("s" * 1000, gets[3]["target"])  # an oversized name is not written to the log
+            self.assertNotIn("ghp_abcdefghijklmnopqrstuvwx", log_text)  # flagged values are redacted in "reason" too
 
     def test_a_tool_name_listed_twice_is_hidden_and_blocked(self):
         asyncio.run(self._duplicate_name_scenario())
