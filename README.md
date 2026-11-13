@@ -97,11 +97,14 @@ of the threshold. They describe what happened in this one call.
 mcp-sentinel runs the official `mcp` SDK on both sides. Downstream, it opens
 a real client session against the wrapped server. Upstream, it runs its own
 server that the calling client talks to. Every `tools/list` and `tools/call`
-passes through `rules.py` before it reaches either side. Resources and
-prompts pass straight through unscored if the downstream server has them
-(scoring is tools-only for now), and only get advertised upstream if the
-downstream actually supports them, so mcp-sentinel doesn't claim a
-capability the real server doesn't have.
+passes through `rules.py` before it reaches either side. At startup it reads
+every page of the server's tool list and scores each tool. A call to a tool
+it never scored gets blocked. A `resources/read` URI and `prompts/get`
+arguments get the same payload checks as tool arguments, so
+`file:///etc/passwd` or a cloud metadata URL is refused. Resources and
+prompts only get advertised upstream if the downstream actually supports
+them, so mcp-sentinel doesn't claim a capability the real server doesn't
+have.
 
 `test_sentinel.py` proves this over the SDK's in-memory transport: a fake
 downstream server, a real sentinel instance in front of it, a real client
@@ -143,7 +146,8 @@ have.
 What's not: this has been run against one official reference server and a
 handful of hand-built ones, not a wide corpus of real-world MCP servers.
 There's no handling yet for a server sending `tools/list_changed` mid-session
-(severities are computed once, at connect time). There's no concurrency or
+(severities are computed once, at connect time, and a tool added later stays
+blocked until restart). There's no concurrency or
 load testing; it's built for one client and one wrapped server per process,
 which matches how MCP clients invoke servers today. Call that a tested v1,
 not a production deployment.

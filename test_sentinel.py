@@ -11,12 +11,12 @@ from contextlib import asynccontextmanager
 
 import anyio
 import mcp.types as types
-from mcp import ClientSession
+from mcp import ClientSession, MCPError
 from mcp.server.lowlevel import Server
 from mcp.shared.memory import create_client_server_memory_streams
 
 from rules import classify_tools
-from sentinel import _effective_env, _parse_env, _redact, _tool_to_dict, build_upstream_server
+from sentinel import MAX_TOOL_PAGES, _effective_env, _parse_env, _redact, _tool_to_dict, build_upstream_server, list_all_tools
 
 
 @asynccontextmanager
@@ -205,6 +205,131 @@ class SentinelIntegrationTests(unittest.TestCase):
 
             decisions = [json.loads(line)["decision"] for line in log_path.read_text().splitlines()]
             self.assertIn("downstream_error", decisions)
+
+    def test_startup_reads_every_tools_list_page(self):
+        asyncio.run(self._all_pages_scenario())
+
+    async def _all_pages_scenario(self):
+        async with _connect(_make_paginated_downstream()) as downstream:
+            await downstream.initialize()
+            self.assertEqual([t.name for t in await list_all_tools(downstream)], ["get_weather", "run_shell"])
+
+    def test_a_downstream_that_never_stops_paging_cannot_hang_startup(self):
+        asyncio.run(self._endless_pages_scenario())
+
+    async def _endless_pages_scenario(self):
+        async def list_tools(ctx, params):
+            return types.ListToolsResult(tools=[types.Tool(name="t", input_schema={"type": "object"})], next_cursor="again")
+
+        endless = Server("endless-downstream", on_list_tools=list_tools)
+        async with _connect(endless) as downstream:
+            await downstream.initialize()
+            with anyio.fail_after(5):
+                tools = await list_all_tools(downstream)
+            self.assertLessEqual(len(tools), MAX_TOOL_PAGES)
+
+    def test_tools_scored_from_every_page_are_listed_and_unscored_ones_are_not(self):
+        asyncio.run(self._listing_scenario())
+
+    async def _listing_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(_make_paginated_downstream()) as downstream:
+                init_result = await downstream.initialize()
+                # Scored from every page: both tools are known.
+                severities = classify_tools([_tool_to_dict(t) for t in await list_all_tools(downstream)])
+                upstream = build_upstream_server(downstream, severities, "critical", log_path, init_result.capabilities, call_timeout=None)
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    self.assertEqual(sorted(t.name for t in (await client.list_tools()).tools), ["get_weather", "run_shell"])
+
+                # Scored from the first page only: run_shell is unknown, so it stays hidden.
+                upstream = build_upstream_server(downstream, {"get_weather": ("low", [])}, "critical", log_path,
+                                                 init_result.capabilities, call_timeout=None)
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    self.assertEqual([t.name for t in (await client.list_tools()).tools], ["get_weather"])
+
+    def test_a_call_to_a_tool_that_was_never_scored_is_blocked(self):
+        asyncio.run(self._unscored_call_scenario())
+
+    async def _unscored_call_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(_make_paginated_downstream()) as downstream:
+                init_result = await downstream.initialize()
+                upstream = build_upstream_server(downstream, {"get_weather": ("low", [])}, "critical", log_path,
+                                                 init_result.capabilities, call_timeout=None)
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    result = await client.call_tool("run_shell", {"cmd": "ls"})
+                    self.assertTrue(result.is_error)
+                    self.assertNotIn("executed", result.content[0].text)
+
+            calls = [json.loads(line) for line in log_path.read_text().splitlines()]
+            self.assertIn(("run_shell", "block"), {(e["tool"], e["decision"]) for e in calls if e["event"] == "call"})
+
+    def test_resource_reads_with_a_sensitive_or_internal_uri_are_blocked(self):
+        asyncio.run(self._resource_payload_scenario())
+
+    async def _resource_payload_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(_make_fake_downstream(with_resources=True)) as downstream:
+                init_result = await downstream.initialize()
+                upstream = build_upstream_server(downstream, {}, "critical", log_path, init_result.capabilities, call_timeout=None)
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    for uri in ("file:///etc/passwd", "file:///notes/../../home/me/.ssh/id_rsa", "http://169.254.169.254/latest/meta-data"):
+                        with self.assertRaises(MCPError):
+                            await client.read_resource(uri)
+                    ok = await client.read_resource("file:///notes.txt")
+                    self.assertIn("hello from a resource", ok.contents[0].text)
+
+            reads = [json.loads(line) for line in log_path.read_text().splitlines() if json.loads(line)["event"] == "resource_read"]
+            self.assertEqual([e["decision"] for e in reads], ["block", "block", "block", "allow"])
+
+    def test_prompt_arguments_are_checked_before_they_reach_the_server(self):
+        asyncio.run(self._prompt_payload_scenario())
+
+    async def _prompt_payload_scenario(self):
+        async def get_prompt(ctx, params):
+            return types.GetPromptResult(messages=[types.PromptMessage(
+                role="user", content=types.TextContent(type="text", text=f"summarise {params.arguments}"))])
+
+        async def list_prompts(ctx, params):
+            return types.ListPromptsResult(prompts=[types.Prompt(name="summarise")])
+
+        prompts = Server("prompt-downstream", on_list_prompts=list_prompts, on_get_prompt=get_prompt)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(prompts) as downstream:
+                init_result = await downstream.initialize()
+                upstream = build_upstream_server(downstream, {}, "critical", log_path, init_result.capabilities, call_timeout=None)
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    with self.assertRaises(MCPError):
+                        await client.get_prompt("summarise", {"file": "../../etc/shadow"})
+                    ok = await client.get_prompt("summarise", {"file": "report.txt"})
+                    self.assertIn("report.txt", ok.messages[0].content.text)
+
+            gets = [json.loads(line) for line in log_path.read_text().splitlines() if json.loads(line)["event"] == "prompt_get"]
+            self.assertEqual([e["decision"] for e in gets], ["block", "allow"])
+
+
+def _make_paginated_downstream() -> Server:
+    """Two tools/list pages: get_weather on the first, run_shell on the second."""
+    async def list_tools(ctx, params):
+        if params and params.cursor == "page2":
+            return types.ListToolsResult(tools=[types.Tool(name="run_shell", description="Runs a shell command.",
+                                                           input_schema={"type": "object", "properties": {"cmd": {"type": "string"}}})])
+        return types.ListToolsResult(tools=[types.Tool(name="get_weather", description="Returns the weather.",
+                                                       input_schema={"type": "object"})], next_cursor="page2")
+
+    async def call_tool(ctx, params):
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"executed {params.name}")])
+
+    return Server("paginated-downstream", on_list_tools=list_tools, on_call_tool=call_tool)
 
 
 class RedactTests(unittest.TestCase):

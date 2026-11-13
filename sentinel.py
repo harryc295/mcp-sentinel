@@ -11,7 +11,6 @@ import asyncio
 import json
 import os
 import pathlib
-import re
 import sys
 from datetime import datetime, timezone
 
@@ -33,6 +32,21 @@ from rules import (
 )
 
 MAX_ARGUMENT_BYTES = 64_000  # DoS guard: a multi-MB argument blob isn't a real tool call
+MAX_TOOL_PAGES = 100  # a downstream that never stops paging must not hang startup or tools/list
+
+
+async def list_all_tools(downstream: ClientSession) -> list[types.Tool]:
+    """Every tools/list page. Stops at MAX_TOOL_PAGES or a repeated cursor; a tool past
+    that point is never scored, and calls to unscored tools are blocked."""
+    tools, cursor, seen = [], None, set()
+    for _ in range(MAX_TOOL_PAGES):
+        result = await downstream.list_tools(params=types.PaginatedRequestParams(cursor=cursor) if cursor else None)
+        tools.extend(result.tools)
+        cursor = result.next_cursor
+        if not cursor or cursor in seen:
+            break
+        seen.add(cursor)
+    return tools
 
 
 def _tool_to_dict(tool: types.Tool) -> dict:
@@ -66,11 +80,20 @@ def _blocked(text: str) -> types.CallToolResult:
 
 def build_upstream_server(downstream: ClientSession, severities: dict, block_severity: str, log_path: pathlib.Path,
                            capabilities, call_timeout: float | None) -> Server:
+    def _check_or_refuse(event: str, target: str, arguments: dict):
+        """resources/read and prompts/get carry attacker-reachable input too (a URI, prompt
+        arguments): run the same payload checks as tools/call and refuse with an error."""
+        flags = check_payload(target, "", arguments)
+        _log(log_path, {"event": event, "target": target, "arguments": arguments,
+                         "decision": "block" if flags else "allow", "reason": "; ".join(flags)})
+        if flags:
+            raise MCPError(types.INVALID_PARAMS, f"[mcp-sentinel] blocked: {'; '.join(flags)}")
+
     async def handle_list_tools(ctx, params) -> types.ListToolsResult:
-        # First page only, no cursor: tools are scored at startup from the first page, so
-        # serving later pages would list tools that were never scored (they'd count as "low").
-        result = await downstream.list_tools()
-        visible = [t for t in result.tools if SEVERITY_RANK[severities.get(t.name, ("low", []))[0]] < SEVERITY_RANK[block_severity]]
+        # One merged list, no cursor. Only tools scored at startup are listed: a tool that
+        # appeared later was never scored, and handle_call_tool blocks it anyway.
+        tools = await list_all_tools(downstream)
+        visible = [t for t in tools if t.name in severities and SEVERITY_RANK[severities[t.name][0]] < SEVERITY_RANK[block_severity]]
         return types.ListToolsResult(tools=visible)
 
     async def handle_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
@@ -81,7 +104,12 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
                              "reason": f"argument payload is {size} bytes, over the {MAX_ARGUMENT_BYTES}-byte limit"})
             return _blocked("blocked: argument payload too large")
 
-        severity, reasons = severities.get(name, ("low", []))
+        if name not in severities:
+            reason = "tool was not listed when mcp-sentinel started, so it was never scored"
+            _log(log_path, {"event": "call", "tool": name, "arguments": arguments, "decision": "block", "reason": reason})
+            return _blocked(f"blocked: {reason}")
+
+        severity, reasons = severities[name]
         payload_flags = check_payload(name, "", arguments)
         decision, reason = decide(severity, payload_flags, block_severity)
 
@@ -107,6 +135,7 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
             return await downstream.list_resources(params=params)
 
         async def handle_read_resource(ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
+            _check_or_refuse("resource_read", "resources/read", {"uri": params.uri})
             return await downstream.read_resource(params.uri)
 
         async def handle_list_resource_templates(ctx, params) -> types.ListResourceTemplatesResult:
@@ -120,6 +149,7 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
             return await downstream.list_prompts(params=params)
 
         async def handle_get_prompt(ctx, params: types.GetPromptRequestParams) -> types.GetPromptResult:
+            _check_or_refuse("prompt_get", f"prompts/get {params.name}", params.arguments or {})
             return await downstream.get_prompt(params.name, params.arguments)
 
         handlers.update(on_list_prompts=handle_list_prompts, on_get_prompt=handle_get_prompt)
@@ -146,8 +176,7 @@ async def run(command: str, args: list[str], env: dict, block_severity: str, log
     async with stdio_client(server_params) as (down_read, down_write):
         async with ClientSession(down_read, down_write) as downstream:
             init_result = await downstream.initialize()
-            tools_result = await downstream.list_tools()
-            tool_dicts = [_tool_to_dict(t) for t in tools_result.tools]
+            tool_dicts = [_tool_to_dict(t) for t in await list_all_tools(downstream)]
 
             trifecta = check_lethal_trifecta(tool_dicts)
             if trifecta:
