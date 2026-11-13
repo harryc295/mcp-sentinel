@@ -13,13 +13,12 @@ import os
 import pathlib
 import re
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import mcp.types as types
-from mcp import ClientSession, McpError
+from mcp import ClientSession, MCPError
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.lowlevel import Server
-from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.server.stdio import stdio_server
 
 from rules import (
@@ -37,7 +36,7 @@ MAX_ARGUMENT_BYTES = 64_000  # DoS guard: a multi-MB argument blob isn't a real 
 
 
 def _tool_to_dict(tool: types.Tool) -> dict:
-    return {"name": tool.name, "description": tool.description or "", "inputSchema": tool.inputSchema or {}}
+    return {"name": tool.name, "description": tool.description or "", "inputSchema": tool.input_schema or {}}
 
 
 def _redact(value):
@@ -61,23 +60,26 @@ def _log(path: pathlib.Path, record: dict):
     print(f"[mcp-sentinel] {record['event']}: {record.get('reason', record.get('detail', ''))}", file=sys.stderr)
 
 
+def _blocked(text: str) -> types.CallToolResult:
+    return types.CallToolResult(content=[types.TextContent(type="text", text=f"[mcp-sentinel] {text}")], is_error=True)
+
+
 def build_upstream_server(downstream: ClientSession, severities: dict, block_severity: str, log_path: pathlib.Path,
                            capabilities, call_timeout: float | None) -> Server:
-    server = Server("mcp-sentinel")
-    timeout = timedelta(seconds=call_timeout) if call_timeout else None
-
-    @server.list_tools()
-    async def handle_list_tools() -> list[types.Tool]:
+    async def handle_list_tools(ctx, params) -> types.ListToolsResult:
+        # First page only, no cursor: tools are scored at startup from the first page, so
+        # serving later pages would list tools that were never scored (they'd count as "low").
         result = await downstream.list_tools()
-        return [t for t in result.tools if SEVERITY_RANK[severities.get(t.name, ("low", []))[0]] < SEVERITY_RANK[block_severity]]
+        visible = [t for t in result.tools if SEVERITY_RANK[severities.get(t.name, ("low", []))[0]] < SEVERITY_RANK[block_severity]]
+        return types.ListToolsResult(tools=visible)
 
-    @server.call_tool()
-    async def handle_call_tool(name: str, arguments: dict):
-        size = len(json.dumps(arguments or {}))
+    async def handle_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
+        name, arguments = params.name, params.arguments or {}
+        size = len(json.dumps(arguments))
         if size > MAX_ARGUMENT_BYTES:
             _log(log_path, {"event": "call", "tool": name, "arguments": "<omitted, too large>", "decision": "block",
                              "reason": f"argument payload is {size} bytes, over the {MAX_ARGUMENT_BYTES}-byte limit"})
-            return types.CallToolResult(content=[types.TextContent(type="text", text="[mcp-sentinel] blocked: argument payload too large")], isError=True)
+            return _blocked("blocked: argument payload too large")
 
         severity, reasons = severities.get(name, ("low", []))
         payload_flags = check_payload(name, "", arguments)
@@ -86,44 +88,43 @@ def build_upstream_server(downstream: ClientSession, severities: dict, block_sev
         _log(log_path, {"event": "call", "tool": name, "arguments": arguments, "decision": decision, "reason": reason or "; ".join(reasons)})
 
         if decision == "block":
-            return types.CallToolResult(content=[types.TextContent(type="text", text=f"[mcp-sentinel] blocked: {reason}")], isError=True)
+            return _blocked(f"blocked: {reason}")
 
         try:
-            result = await downstream.call_tool(name, arguments, read_timeout_seconds=timeout)
-        except McpError as e:
-            # A timed-out call surfaces as McpError too (the SDK converts anyio's
-            # TimeoutError before it reaches us) -- one branch covers both cases.
+            result = await downstream.call_tool(name, arguments, read_timeout_seconds=call_timeout)
+        except (MCPError, RuntimeError) as e:
+            # MCPError covers downstream errors and timeouts (the SDK converts the timeout
+            # before it reaches us). RuntimeError is how the 2.x SDK refuses an "input
+            # required" or claimed reply: neither is proxied, so the call fails closed.
             _log(log_path, {"event": "call", "tool": name, "arguments": "<omitted, already logged above>", "decision": "downstream_error", "reason": str(e)})
-            return types.CallToolResult(content=[types.TextContent(type="text", text=f"[mcp-sentinel] downstream error: {e}")], isError=True)
-        return result.content
+            return _blocked(f"downstream error: {e}")
+        return result
+
+    handlers = {"on_list_tools": handle_list_tools, "on_call_tool": handle_call_tool}
 
     if capabilities.resources:
-        @server.list_resources()
-        async def handle_list_resources():
-            return (await downstream.list_resources()).resources
+        async def handle_list_resources(ctx, params) -> types.ListResourcesResult:
+            return await downstream.list_resources(params=params)
 
-        @server.read_resource()
-        async def handle_read_resource(uri):
-            result = await downstream.read_resource(uri)
-            return [
-                ReadResourceContents(content=c.text if isinstance(c, types.TextResourceContents) else c.blob, mime_type=c.mimeType)
-                for c in result.contents
-            ]
+        async def handle_read_resource(ctx, params: types.ReadResourceRequestParams) -> types.ReadResourceResult:
+            return await downstream.read_resource(params.uri)
 
-        @server.list_resource_templates()
-        async def handle_list_resource_templates():
-            return (await downstream.list_resource_templates()).resourceTemplates
+        async def handle_list_resource_templates(ctx, params) -> types.ListResourceTemplatesResult:
+            return await downstream.list_resource_templates(params=params)
+
+        handlers.update(on_list_resources=handle_list_resources, on_read_resource=handle_read_resource,
+                        on_list_resource_templates=handle_list_resource_templates)
 
     if capabilities.prompts:
-        @server.list_prompts()
-        async def handle_list_prompts():
-            return (await downstream.list_prompts()).prompts
+        async def handle_list_prompts(ctx, params) -> types.ListPromptsResult:
+            return await downstream.list_prompts(params=params)
 
-        @server.get_prompt()
-        async def handle_get_prompt(name, arguments):
-            return await downstream.get_prompt(name, arguments)
+        async def handle_get_prompt(ctx, params: types.GetPromptRequestParams) -> types.GetPromptResult:
+            return await downstream.get_prompt(params.name, params.arguments)
 
-    return server
+        handlers.update(on_list_prompts=handle_list_prompts, on_get_prompt=handle_get_prompt)
+
+    return Server("mcp-sentinel", **handlers)
 
 
 def _effective_env(explicit_env: dict) -> dict:

@@ -7,43 +7,53 @@ import os
 import pathlib
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 
+import anyio
 import mcp.types as types
+from mcp import ClientSession
 from mcp.server.lowlevel import Server
-from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.shared.memory import create_client_server_memory_streams
 
 from rules import classify_tools
 from sentinel import _effective_env, _parse_env, _redact, _tool_to_dict, build_upstream_server
 
 
-def _make_fake_downstream(with_resources=False) -> Server:
-    server = Server("fake-downstream")
+@asynccontextmanager
+async def _connect(server: Server):
+    """A ClientSession wired to `server` in memory: the same client type sentinel uses for real."""
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(lambda: server.run(*server_streams, server.create_initialization_options()))
+            async with ClientSession(*client_streams) as session:
+                yield session
+            tg.cancel_scope.cancel()
 
-    @server.list_tools()
-    async def list_tools():
-        return [
+
+def _make_fake_downstream(with_resources=False, slow_tool_seconds=0.0) -> Server:
+    async def list_tools(ctx, params):
+        return types.ListToolsResult(tools=[
             types.Tool(name="get_weather", description="Returns the current weather for a city.",
-                       inputSchema={"type": "object", "properties": {"city": {"type": "string"}}}),
+                       input_schema={"type": "object", "properties": {"city": {"type": "string"}}}),
             types.Tool(name="read_file", description="Reads a local file.",
-                       inputSchema={"type": "object", "properties": {"path": {"type": "string"}}}),
+                       input_schema={"type": "object", "properties": {"path": {"type": "string"}}}),
             types.Tool(name="delete_database", description="Deletes a database.",
-                       inputSchema={"type": "object", "properties": {"name": {"type": "string"}}}),
-        ]
+                       input_schema={"type": "object", "properties": {"name": {"type": "string"}}}),
+        ])
 
-    @server.call_tool()
-    async def call_tool(name, arguments):
-        return [types.TextContent(type="text", text=f"executed {name} with {arguments}")]
+    async def call_tool(ctx, params):
+        if slow_tool_seconds:
+            await anyio.sleep(slow_tool_seconds)
+        return types.CallToolResult(content=[types.TextContent(type="text", text=f"executed {params.name} with {params.arguments}")])
 
-    if with_resources:
-        @server.list_resources()
-        async def list_resources():
-            return [types.Resource(uri="file:///notes.txt", name="notes.txt")]
+    async def list_resources(ctx, params):
+        return types.ListResourcesResult(resources=[types.Resource(uri="file:///notes.txt", name="notes.txt")])
 
-        @server.read_resource()
-        async def read_resource(uri):
-            return "hello from a resource"
+    async def read_resource(ctx, params):
+        return types.ReadResourceResult(contents=[types.TextResourceContents(uri=params.uri, text="hello from a resource")])
 
-    return server
+    resource_handlers = {"on_list_resources": list_resources, "on_read_resource": read_resource} if with_resources else {}
+    return Server("fake-downstream", on_list_tools=list_tools, on_call_tool=call_tool, **resource_handlers)
 
 
 class SentinelIntegrationTests(unittest.TestCase):
@@ -54,14 +64,14 @@ class SentinelIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = pathlib.Path(tmp) / "audit.jsonl"
 
-            async with create_connected_server_and_client_session(_make_fake_downstream()) as downstream:
+            async with _connect(_make_fake_downstream()) as downstream:
                 init_result = await downstream.initialize()
                 tools = (await downstream.list_tools()).tools
                 severities = classify_tools([_tool_to_dict(t) for t in tools])
 
                 upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=None)
 
-                async with create_connected_server_and_client_session(upstream) as client:
+                async with _connect(upstream) as client:
                     await client.initialize()
 
                     visible = {t.name for t in (await client.list_tools()).tools}
@@ -69,18 +79,18 @@ class SentinelIntegrationTests(unittest.TestCase):
                     self.assertNotIn("delete_database", visible)  # high severity, hidden at list time too
 
                     ok = await client.call_tool("get_weather", {"city": "london"})
-                    self.assertFalse(ok.isError)
+                    self.assertFalse(ok.is_error)
 
                     blocked = await client.call_tool("delete_database", {"name": "prod"})
-                    self.assertTrue(blocked.isError)
+                    self.assertTrue(blocked.is_error)
 
                     # read_file is only "medium" by static severity (passes the "high" threshold),
                     # but a path-traversal argument must still be blocked at call time.
                     traversal = await client.call_tool("read_file", {"path": "../../etc/passwd"})
-                    self.assertTrue(traversal.isError)
+                    self.assertTrue(traversal.is_error)
 
                     oversized = await client.call_tool("read_file", {"path": "x" * 100_000})
-                    self.assertTrue(oversized.isError)
+                    self.assertTrue(oversized.is_error)
 
             events = [json.loads(line) for line in log_path.read_text().splitlines()]
             calls = {(e["tool"], e["decision"]) for e in events if e["event"] == "call"}
@@ -94,13 +104,13 @@ class SentinelIntegrationTests(unittest.TestCase):
     async def _resources_scenario(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = pathlib.Path(tmp) / "audit.jsonl"
-            async with create_connected_server_and_client_session(_make_fake_downstream(with_resources=True)) as downstream:
+            async with _connect(_make_fake_downstream(with_resources=True)) as downstream:
                 init_result = await downstream.initialize()
                 tools = (await downstream.list_tools()).tools
                 severities = classify_tools([_tool_to_dict(t) for t in tools])
                 upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=None)
 
-                async with create_connected_server_and_client_session(upstream) as client:
+                async with _connect(upstream) as client:
                     await client.initialize()
                     resources = (await client.list_resources()).resources
                     self.assertEqual([r.name for r in resources], ["notes.txt"])
@@ -113,16 +123,88 @@ class SentinelIntegrationTests(unittest.TestCase):
     async def _no_resources_scenario(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = pathlib.Path(tmp) / "audit.jsonl"
-            async with create_connected_server_and_client_session(_make_fake_downstream(with_resources=False)) as downstream:
+            async with _connect(_make_fake_downstream(with_resources=False)) as downstream:
                 init_result = await downstream.initialize()
                 tools = (await downstream.list_tools()).tools
                 severities = classify_tools([_tool_to_dict(t) for t in tools])
                 upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=None)
 
-                async with create_connected_server_and_client_session(upstream) as client:
+                async with _connect(upstream) as client:
                     await client.initialize()
                     with self.assertRaises(Exception):
                         await client.list_resources()
+
+    def test_a_slow_downstream_call_times_out_as_an_error_not_a_hang(self):
+        asyncio.run(self._timeout_scenario())
+
+    async def _timeout_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(_make_fake_downstream(slow_tool_seconds=1)) as downstream:
+                init_result = await downstream.initialize()
+                tools = (await downstream.list_tools()).tools
+                severities = classify_tools([_tool_to_dict(t) for t in tools])
+                upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=0.2)
+
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    with anyio.fail_after(3):
+                        result = await client.call_tool("get_weather", {"city": "london"})
+                    self.assertTrue(result.is_error)
+
+            decisions = [json.loads(line)["decision"] for line in log_path.read_text().splitlines()]
+            self.assertIn("downstream_error", decisions)
+
+    def test_unscored_tools_on_later_list_pages_are_not_exposed(self):
+        asyncio.run(self._pagination_scenario())
+
+    async def _pagination_scenario(self):
+        async def list_tools(ctx, params):
+            if params and params.cursor == "page2":
+                return types.ListToolsResult(tools=[types.Tool(name="run_shell", description="Runs a shell command.",
+                                                               input_schema={"type": "object", "properties": {"cmd": {"type": "string"}}})])
+            return types.ListToolsResult(tools=[types.Tool(name="get_weather", description="Returns the weather.",
+                                                           input_schema={"type": "object"})], next_cursor="page2")
+
+        async def call_tool(ctx, params):
+            return types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+
+        paginated = Server("paginated-downstream", on_list_tools=list_tools, on_call_tool=call_tool)
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            async with _connect(paginated) as downstream:
+                init_result = await downstream.initialize()
+                tools = (await downstream.list_tools()).tools
+                severities = classify_tools([_tool_to_dict(t) for t in tools])
+                upstream = build_upstream_server(downstream, severities, "high", log_path, init_result.capabilities, call_timeout=None)
+
+                async with _connect(upstream) as client:
+                    await client.initialize()
+                    listed = await client.list_tools()
+                    self.assertIsNone(listed.next_cursor)
+                    self.assertEqual([t.name for t in listed.tools], ["get_weather"])
+
+    def test_an_unexpected_downstream_reply_is_refused_and_audited(self):
+        asyncio.run(self._unexpected_reply_scenario())
+
+    async def _unexpected_reply_scenario(self):
+        class RaisesLikeTheSdk:
+            """mcp 2.x ClientSession.call_tool raises RuntimeError for input-required or claimed replies."""
+            async def call_tool(self, *args, **kwargs):
+                raise RuntimeError("Server returned InputRequiredResult")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = pathlib.Path(tmp) / "audit.jsonl"
+            upstream = build_upstream_server(RaisesLikeTheSdk(), {"get_weather": ("low", [])}, "high", log_path,
+                                             types.ServerCapabilities(), call_timeout=None)
+            async with _connect(upstream) as client:
+                await client.initialize()
+                result = await client.call_tool("get_weather", {"city": "london"})
+                self.assertTrue(result.is_error)
+                self.assertIn("[mcp-sentinel]", result.content[0].text)
+
+            decisions = [json.loads(line)["decision"] for line in log_path.read_text().splitlines()]
+            self.assertIn("downstream_error", decisions)
 
 
 class RedactTests(unittest.TestCase):
